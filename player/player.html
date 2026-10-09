@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<title>SS|idle|0|0|</title>
+<style>
+  html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }
+  #yt, .sc { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
+</style>
+</head>
+<body>
+<div id="yt"></div>
+<script>
+/*
+  Reproductor de SlopSound. Lo abre el cliente en un navegador oculto (uno por parlante).
+  Recibe órdenes por la dirección:  #n=<contador>&s=yt|sc&id=<ID>&t=<segundos>
+    - Solo acepta IDs: YouTube = 11 caracteres [A-Za-z0-9_-], SoundCloud = número.
+    - La dirección del video la arma esta página, nunca viene de afuera.
+  Responde por el título:  SS|<estado>|<posición>|<duración>|<error>
+    estado: idle | loading | playing | paused | ended | error
+*/
+(function () {
+  var state = "idle", pos = 0, dur = 0, err = "";
+  var current = { s: "", id: "" };
+  var yt = null, ytReady = false, ytPending = null;
+  var sc = null, scFrame = null;
+
+  function report() {
+    document.title = ["SS", state, pos.toFixed(1), dur.toFixed(1), err].join("|");
+  }
+  function setState(s, e) { state = s; err = e || ""; report(); }
+
+  function parseHash() {
+    var out = {};
+    location.hash.replace(/^#/, "").split("&").forEach(function (kv) {
+      var i = kv.indexOf("=");
+      if (i > 0) out[kv.slice(0, i)] = decodeURIComponent(kv.slice(i + 1));
+    });
+    return out;
+  }
+  var validYT = function (id) { return /^[A-Za-z0-9_-]{11}$/.test(id); };
+  var validSC = function (id) { return /^\d{1,20}$/.test(id); };
+
+  // ---------------- YouTube ----------------
+  function loadYTApi() {
+    if (window.YT && window.YT.Player) { ytReady = true; return; }
+    var tag = document.createElement("script");
+    tag.src = "https://www.youtube.com/iframe_api";
+    document.head.appendChild(tag);
+  }
+  window.onYouTubeIframeAPIReady = function () {
+    ytReady = true;
+    if (ytPending) { var p = ytPending; ytPending = null; playYT(p.id, p.t); }
+  };
+  function playYT(id, t) {
+    stopSC();
+    if (!ytReady) { ytPending = { id: id, t: t }; loadYTApi(); return; }
+    if (yt) {
+      yt.loadVideoById({ videoId: id, startSeconds: t });
+      return;
+    }
+    yt = new YT.Player("yt", {
+      width: "100%", height: "100%", videoId: id,
+      playerVars: { autoplay: 1, start: Math.floor(t), controls: 0, disablekb: 1, playsinline: 1, rel: 0, fs: 0, iv_load_policy: 3 },
+      events: {
+        onReady: function (e) { e.target.setVolume(100); e.target.unMute(); e.target.seekTo(t, true); e.target.playVideo(); },
+        onStateChange: function (e) {
+          if (e.data === YT.PlayerState.PLAYING) setState("playing");
+          else if (e.data === YT.PlayerState.PAUSED) setState("paused");
+          else if (e.data === YT.PlayerState.ENDED) setState("ended");
+          else if (e.data === YT.PlayerState.BUFFERING) setState("loading");
+        },
+        onError: function (e) { setState("error", "yt" + e.data); },
+      },
+    });
+  }
+  function stopYT() {
+    if (yt && yt.stopVideo) { try { yt.stopVideo(); } catch (e) {} }
+  }
+
+  // ---------------- SoundCloud ----------------
+  function loadSCApi(cb) {
+    if (window.SC && window.SC.Widget) return cb();
+    var tag = document.createElement("script");
+    tag.src = "https://w.soundcloud.com/player/api.js";
+    tag.onload = cb;
+    tag.onerror = function () { setState("error", "scapi"); };
+    document.head.appendChild(tag);
+  }
+  // Cada tema usa un reproductor nuevo: el widget no avisa "listo" si se reutiliza
+  function playSC(id, t) {
+    stopYT();
+    stopSC();
+    var frame = document.createElement("iframe");
+    frame.className = "sc";
+    frame.setAttribute("allow", "autoplay; encrypted-media");
+    frame.src = "https://w.soundcloud.com/player/?url=" + encodeURIComponent("https://api.soundcloud.com/tracks/" + id) +
+      "&auto_play=true&visual=false&show_comments=false";
+    document.body.appendChild(frame);
+    scFrame = frame;
+    loadSCApi(function () {
+      if (scFrame !== frame) return; // ya se pidió otro tema
+      var w = SC.Widget(frame), seeked = t <= 1;
+      sc = w;
+      w.bind(SC.Widget.Events.READY, function () {
+        w.setVolume(100);
+        w.getCurrentSound(function (s) { if (!s) setState("error", "sc404"); });
+        w.getDuration(function (ms) { dur = (ms || 0) / 1000; report(); });
+        w.play();
+      });
+      w.bind(SC.Widget.Events.PLAY, function () {
+        if (!seeked) { seeked = true; w.seekTo(t * 1000); }
+        setState("playing");
+      });
+      w.bind(SC.Widget.Events.PAUSE, function () { if (sc === w) setState("paused"); });
+      w.bind(SC.Widget.Events.FINISH, function () { if (sc === w) setState("ended"); });
+      w.bind(SC.Widget.Events.ERROR, function () { if (sc === w) setState("error", "sc"); });
+      w.bind(SC.Widget.Events.PLAY_PROGRESS, function (e) { if (sc === w) pos = (e.currentPosition || 0) / 1000; });
+    });
+  }
+  function stopSC() {
+    if (sc) { try { sc.pause(); } catch (e) {} }
+    sc = null;
+    if (scFrame) { scFrame.remove(); scFrame = null; }
+  }
+
+  // ---------------- Órdenes ----------------
+  function apply() {
+    var h = parseHash();
+    var t = Math.max(0, parseFloat(h.t) || 0);
+    if (h.s === "yt" && validYT(h.id)) {
+      if (current.s === "yt" && current.id === h.id && yt && yt.seekTo) { yt.seekTo(t, true); yt.playVideo(); return; }
+      current = { s: "yt", id: h.id }; pos = t; dur = 0; setState("loading");
+      playYT(h.id, t);
+    } else if (h.s === "sc" && validSC(h.id)) {
+      if (current.s === "sc" && current.id === h.id && sc) { sc.seekTo(t * 1000); sc.play(); return; }
+      current = { s: "sc", id: h.id }; pos = t; dur = 0; setState("loading");
+      playSC(h.id, t);
+    } else {
+      current = { s: "", id: "" }; stopYT(); stopSC(); setState("idle");
+    }
+  }
+  window.addEventListener("hashchange", apply);
+
+  // Reporta la posición dos veces por segundo
+  setInterval(function () {
+    if (current.s === "yt" && yt && yt.getCurrentTime) {
+      pos = yt.getCurrentTime() || 0;
+      var d = yt.getDuration ? yt.getDuration() : 0;
+      if (d > 0) dur = d;
+    }
+    report();
+  }, 500);
+
+  apply();
+})();
+</script>
+</body>
+</html>
